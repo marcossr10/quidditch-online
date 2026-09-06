@@ -35,7 +35,7 @@ ws.on("message", (raw) => { const m = JSON.parse(raw); if (m.id && pending.has(m
 const cmd = (method, params = {}) => new Promise((res) => { const id = ++seq; pending.set(id, res); ws.send(JSON.stringify({ id, method, params })); });
 const evalJs = async (expression) => {
   const r = await cmd("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
-  if (r.result?.exceptionDetails) fail(`excepción JS: ${(r.result.exceptionDetails.text || "").slice(0, 200)}`);
+  if (r.result?.exceptionDetails) fail(`excepción JS en [${expression.slice(0, 120)}]: ${JSON.stringify(r.result.exceptionDetails).slice(0, 400)}`);
   return r.result?.result?.value;
 };
 const waitFor = async (expression, timeoutMs = 30000) => {
@@ -67,6 +67,28 @@ const errPanel = await evalJs(`document.body.innerText.includes("Error de interf
 if (errPanel) fail("panel de error de interfaz visible");
 const st = await evalJs(`window.__qm.state.currentDate`);
 console.log("OK fecha estado:", st);
+
+// Club propio: Partidas → nueva → liga BR → crear club sustituyendo al 2º equipo
+await evalJs(`document.querySelector('[data-action="reset"]').click()`);
+await waitFor(`document.querySelector('[data-save="new-solo"]') ? true : null`);
+await evalJs(`document.querySelector('[data-save="new-solo"]').click()`);
+await waitFor(`document.querySelector('[data-league-pick="BR"]') ? true : null`);
+await evalJs(`document.querySelector('[data-league-pick="BR"]').click()`);
+await waitFor(`document.querySelector('[data-custom-club="open"]') ? true : null`);
+await evalJs(`document.querySelector('[data-custom-club="open"]').click()`);
+await waitFor(`document.querySelector('[data-custom-input="name"]') ? true : null`);
+await evalJs(`{ const s = document.querySelector('[data-custom-input="replace"]'); s.value = s.options[2].value; s.dispatchEvent(new Event("change", { bubbles: true })); }`);
+const replacedId = await evalJs(`document.querySelector('[data-custom-input="replace"]').value`);
+await evalJs(`{ const i = document.querySelector('[data-custom-input="name"]'); i.value = "Test Club"; i.dispatchEvent(new Event("change", { bubbles: true })); }`);
+await evalJs(`[...document.querySelectorAll('[data-custom-club]')].find((b) => b.dataset.customClub === "create").click()`);
+await waitFor(`document.querySelector(".topbar") ? true : null`, 15000);
+const clubName = await evalJs(`document.querySelector(".topbar").innerText.split("\\n")[0]`);
+if (clubName !== "Test Club") fail(`club propio no creado (topbar: ${clubName})`);
+const squadN = await evalJs(`window.__qm.state.players.filter((p) => p.TeamID === window.__qm.state.managerTeamId).length`);
+if (squadN < 7) fail(`plantilla del club propio muy pequeña: ${squadN}`);
+const mgrId = await evalJs(`window.__qm.state.managerTeamId`);
+if (mgrId !== replacedId) fail("el club no ocupa el lugar del sustituido");
+console.log(`OK club propio "Test Club" sustituye a ${replacedId} con ${squadN} jugadores`);
 ws.close();
 for (const c of children) { try { c.kill(); } catch {} }
 console.log("SOLO TEST: TODO OK");

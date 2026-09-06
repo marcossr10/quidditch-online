@@ -112,6 +112,11 @@ await evalJs(`document.querySelector('[data-view="squad"]').click()`);
 await waitFor(`document.querySelector("[data-promote],[data-demote]") ? true : null`, 15000);
 console.log("OK vista plantilla con acciones de alineación");
 
+// La vista NO debe saltar a inicio con los ticks: esperar cambio de fecha y seguir en plantilla
+const t0 = await evalJs(`document.querySelector(".advance-dock").innerText`);
+await waitFor(`(() => { const t = document.querySelector(".advance-dock").innerText; return (t !== ${JSON.stringify(t0)} && document.querySelector("[data-promote],[data-demote]")) ? t : null; })()`, 90000);
+console.log("OK la vista plantilla sobrevive a los ticks");
+
 // Salir recarga y cae en Mis partidas con el slot online guardado
 await evalJs(`document.querySelector('[data-online="exit"]').click()`);
 await sleep(3000);

@@ -191,6 +191,22 @@ await click('[data-save="menu"]');
 await waitFor(`[...document.querySelectorAll("h1")].some((h) => /My games|Mis partidas/.test(h.innerText)) ? true : null`);
 console.log("OK liga → Mis partidas");
 
+// Quitar el slot online solo desvincula: la sala sigue abierta y se puede reentrar
+const onlineTeam = await evalJs(`JSON.parse(localStorage.getItem("quidditch-manager-saves-v1")).slots.find((s) => s.mode === "online").ref.teamId`);
+await evalJs(`[...document.querySelectorAll('[data-save="delete"]')].find((b) => (b.closest(".panel").querySelector("h3")?.innerText || "").trim() !== ${JSON.stringify(teamAName)}).click()`);
+await waitFor(`document.querySelectorAll('[data-save="load"]').length === 1 ? true : null`);
+console.log("OK quitar online del menú (queda 1 slot)");
+await click('[data-save="online"]');
+await waitFor(`document.querySelector('[data-online="connect"]') ? true : null`);
+await click('[data-online="connect"]');
+await waitFor(`[...document.querySelectorAll('[data-online="join"]')].some((b) => b.closest(".panel").querySelector("h3").innerText.includes("Saver")) ? true : null`, 30000);
+console.log("OK la sala sigue en Salas abiertas");
+await evalJs(`{ const btn = [...document.querySelectorAll('[data-online="join"]')].find((b) => b.closest(".panel").querySelector("h3").innerText.includes("Saver")); const sel = btn.closest(".panel").querySelector('[data-online-input="jteam"]'); sel.value = ${JSON.stringify(onlineTeam)}; sel.dispatchEvent(new Event("change", { bubbles: true })); btn.click(); }`);
+await waitFor(`document.querySelector(".topbar") ? true : null`, 30000);
+const reTeam2 = await evalJs(`window.__qm.state.managerTeamId`);
+if (reTeam2 !== onlineTeam) fail(`reentrada tras quitar: ${reTeam2} (era ${onlineTeam})`);
+console.log("OK reentrada con el mismo equipo tras quitar");
+
 ws.close();
 for (const c of children) { try { c.kill(); } catch {} }
 console.log("SAVES TEST: TODO OK");

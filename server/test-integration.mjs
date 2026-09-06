@@ -100,7 +100,27 @@ console.log("OK shieldPlayer aplicado en servidor");
 // Acción call: listar para vender un jugador (toggle listed)
 b.send(JSON.stringify({ t: "action", action: { type: "call", fn: "sellPlayer", args: [snapB.state.players.find((p) => p.TeamID === "T02").PlayerID] } }));
 await once(b, "snapshot");
+await once(a, "snapshot"); // drenar la copia del broadcast en a (si no, desincroniza las lecturas siguientes)
 console.log("OK sellPlayer aplicado en servidor");
+
+// Negociación: start sincroniza el modal; clear lo cierra en servidor
+// (antes el cierre era solo local y cada snapshot resucitaba el modal)
+const candidates = snap.state.players.filter((p) => p.TeamID !== "T01" && p.TeamID !== "FREE" && p.leagueId === "BR" && !p.shieldedUntil && !p.listed).slice(0, 8);
+let snapNeg = null;
+let candNeg = null;
+for (const cand of candidates) {
+  a.send(JSON.stringify({ t: "action", action: { type: "call", fn: "startNegotiation", args: [cand.PlayerID] } }));
+  snapNeg = await once(a, "snapshot");
+  const neg = snapNeg.state.onlineNegs && snapNeg.state.onlineNegs["T01"];
+  if (neg && neg.playerId === cand.PlayerID) { candNeg = cand; break; }
+}
+if (!candNeg) await fail("startNegotiation no sincronizó con ningún candidato");
+console.log("OK startNegotiation sincroniza el modal con", candNeg.Name);
+a.send(JSON.stringify({ t: "action", action: { type: "call", fn: "clearNegotiation", args: [] } }));
+const snapClear = await once(a, "snapshot");
+const negLeft = snapClear.state.onlineNegs && snapClear.state.onlineNegs["T01"];
+if (negLeft) await fail("clearNegotiation no cerró en servidor (modal resucitado)");
+console.log("OK clearNegotiation cierra en servidor");
 
 // Acción desconocida debe rechazarse
 a.send(JSON.stringify({ t: "action", action: { type: "call", fn: "startAdvance", args: [] } }));

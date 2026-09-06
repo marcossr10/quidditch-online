@@ -3,10 +3,10 @@
 import http from "http";
 import { WebSocketServer } from "ws";
 import { LEAGUES } from "./harness.mjs";
-import { loadAllRooms, createRoom, addManager, tickRoom, applyAction, saveRoom, roomInfo, deleteRoomFile, newToken } from "./rooms.mjs";
+import { loadAllRooms, createRoom, addManager, tickRoom, applyAction, saveRoom, roomInfo, deleteRoomFile, newToken, snapshotJson } from "./rooms.mjs";
 
 const PORT = Number(process.env.PORT || 8787);
-const SERVER_VERSION = "1.8.0";
+const SERVER_VERSION = "1.9.0";
 const TICK_MS = 5000;
 const SAVE_MS = 15000;
 const MIN_DAY_MS = 15000;
@@ -27,14 +27,9 @@ const broadcastRooms = () => {
   for (const room of rooms.values()) for (const ws of room.sockets) send(ws, { t: "rooms", rooms: list, serverVersion: SERVER_VERSION });
   for (const ws of lobby) send(ws, { t: "rooms", rooms: list, serverVersion: SERVER_VERSION });
 };
-// El snapshot lleva los resultados pendientes de TU equipo y los
-// limpia al enviar (si estás conectado, el envío es fiable; si no lo
-// estás, se acumulan hasta que reentres).
-const snapshot = (room, teamId) => {
-  const pending = room.queues?.[teamId] || [];
-  room.queues[teamId] = [];
-  return { t: "snapshot", room: roomInfo(room), myTeam: teamId, state: room.state, pendingResults: pending };
-};
+// snapshotJson() vive en rooms.mjs: serializa dentro del swap para que
+// cada mánager solo reciba SU negociación. sendRaw envía el string tal cual.
+const sendRaw = (ws, str) => { if (ws.readyState === 1) ws.send(str); };
 
 const server = http.createServer((req, res) => {
   if (req.url === "/rooms") {
@@ -71,10 +66,7 @@ wss.on("connection", (ws) => {
       const r = addManager(room, nick, String(msg.teamId || ""), null);
       if (!r.ok) { rooms.delete(room.id); return send(ws, { t: "error", error: r.error }); }
       attach(ws, room, nick, String(msg.teamId));
-      const snap = snapshot(room, String(msg.teamId));
-      snap.managerToken = r.token;
-      snap.creatorToken = room.creatorToken;
-      send(ws, snap);
+      sendRaw(ws, snapshotJson(room, String(msg.teamId), { managerToken: r.token, creatorToken: room.creatorToken }));
       broadcastRooms();
       return;
     }
@@ -94,10 +86,9 @@ wss.on("connection", (ws) => {
       if (!r.ok) return send(ws, { t: "error", error: r.error });
       saveRoom(room);
       attach(ws, room, nick, teamId);
-      const snap = snapshot(room, teamId);
-      snap.managerToken = r.token;
-      if (room.creatorNick && room.creatorNick.toLowerCase() === nick.toLowerCase()) snap.creatorToken = room.creatorToken;
-      send(ws, snap);
+      const extra = { managerToken: r.token };
+      if (room.creatorNick && room.creatorNick.toLowerCase() === nick.toLowerCase()) extra.creatorToken = room.creatorToken;
+      sendRaw(ws, snapshotJson(room, teamId, extra));
       broadcastRooms();
       return;
     }
@@ -124,7 +115,7 @@ wss.on("connection", (ws) => {
       if (!r.ok) return send(ws, { t: "error", error: r.error });
       saveRoom(room);
       room.lastSave = Date.now();
-      for (const peer of room.sockets) send(peer, snapshot(room, peer.meta.teamId));
+      for (const peer of room.sockets) sendRaw(peer, snapshotJson(room, peer.meta.teamId));
       return;
     }
   });
@@ -152,7 +143,7 @@ setInterval(() => {
   for (const room of rooms.values()) {
     const days = tickRoom(room, now);
     if (days > 0) {
-      for (const peer of room.sockets) send(peer, snapshot(room, peer.meta.teamId));
+      for (const peer of room.sockets) sendRaw(peer, snapshotJson(room, peer.meta.teamId));
     }
     if (room.dirty && now - (room.lastSave || 0) > SAVE_MS) {
       try { saveRoom(room); room.lastSave = now; } catch (e) { console.error("save", room.id, e.message); }

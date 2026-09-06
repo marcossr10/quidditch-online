@@ -181,8 +181,15 @@ const ONLINE_CALLABLE = {
   buyPlayer: 2, sellPlayer: 1, sellPlayerToLeague: 1, shieldPlayer: 1,
   renewContract: 2, promoteStarter: 1, demoteStarter: 1,
   startNegotiation: 1, startIntlNegotiation: 1, submitNegotiation: 2,
-  acceptNegotiationCounter: 0, withdrawNegotiation: 0,
+  acceptNegotiationCounter: 0, withdrawNegotiation: 0, clearNegotiation: 0,
 };
+// Acciones que usan state.negotiation: es GLOBAL en el juego single-player,
+// así que en online cada mánager tiene la suya (onlineNegs[teamId]).
+// Se intercambia al entrar/salir de la acción: nadie ve ni pisa la del otro.
+const NEGOTIATION_FNS = new Set([
+  "startNegotiation", "startIntlNegotiation", "submitNegotiation",
+  "acceptNegotiationCounter", "withdrawNegotiation", "clearNegotiation",
+]);
 
 // Aplica una acción de un mánager sobre el estado autoritativo.
 // Devuelve { ok } o { ok:false, error }.
@@ -211,7 +218,19 @@ export function applyAction(room, teamId, action) {
       const fnRef = qm[action.fn];
       if (typeof fnRef !== "function") return { ok: false, error: "ACCION_DESCONOCIDA" };
       room.state.managerTeamId = teamId;
-      try { fnRef(...args); } finally { room.state.managerTeamId = null; }
+      try {
+        if (NEGOTIATION_FNS.has(action.fn)) {
+          room.state.onlineNegs = room.state.onlineNegs || {};
+          room.state.negotiation = room.state.onlineNegs[teamId] || null;
+          try { fnRef(...args); }
+          finally {
+            room.state.onlineNegs[teamId] = room.state.negotiation;
+            room.state.negotiation = null;
+          }
+        } else {
+          fnRef(...args);
+        }
+      } finally { room.state.managerTeamId = null; }
       room.dirty = true;
       return { ok: true };
     }
@@ -219,6 +238,22 @@ export function applyAction(room, teamId, action) {
   } finally {
     room.state = qm.state;
     qm.state = prev;
+  }
+}
+
+// Snapshot serializado para un mánager: lleva su cola de resultados
+// (y la limpia) y SOLO su negociación. La serialización ocurre DENTRO
+// del swap: si se devolviera el objeto y se serializara después, el
+// finally ya habría restaurado las negociaciones de todos.
+export function snapshotJson(room, teamId, extra = {}) {
+  const pending = room.queues?.[teamId] || [];
+  room.queues[teamId] = [];
+  const negs = room.state.onlineNegs || {};
+  room.state.onlineNegs = { [teamId]: negs[teamId] || null };
+  try {
+    return JSON.stringify({ t: "snapshot", room: roomInfo(room), myTeam: teamId, state: room.state, pendingResults: pending, ...extra });
+  } finally {
+    room.state.onlineNegs = negs;
   }
 }
 

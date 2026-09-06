@@ -6,7 +6,7 @@ const SAVE_KEY = "quidditch-manager-save-v2";
 const SAVE_BACKUP_KEY = "quidditch-manager-save-backup";
 const CAREER_SAVE_KEY = "quidditch-career-save-v1";
 const CAREER_BACKUP_KEY = "quidditch-career-save-backup";
-const GAME_VERSION = "1.8.0";
+const GAME_VERSION = "1.9.0";
 const START_YEAR = 2025;
 
 // --- Estado de sesión online (declarado arriba: render() lo lee al arrancar) ---
@@ -53,6 +53,8 @@ let savesMenu = false;
 let currentSaveId = null;
 let savesMessage = "";
 let saveSlotsCache = {};
+let customClub = null;
+let customClubError = "";
 
 // --- Internacionalización (i18n) ---
 // Idiomas disponibles: inglés (en) y español (es). Por defecto el juego arranca en inglés.
@@ -878,6 +880,10 @@ function humanTeamIds(sourceState = state) {
   return sourceState.managerTeamId ? [sourceState.managerTeamId] : [];
 }
 function isHumanTeam(teamId, sourceState = state) { return teamId != null && humanTeamIds(sourceState).includes(teamId); }
+function humanBadge(teamId) {
+  if (!state.onlineManagers || state.onlineManagers.length < 2 || !isHumanTeam(teamId)) return "";
+  return ` <span title="${_("Equipo dirigido por una persona", "Team managed by a person")}">👤</span>`;
+}
 function autoSim(sourceState = state) {
   if (globalThis.__qmHeadless) return true;
   if (sourceState && sourceState.onlineAuto) return true;
@@ -2719,6 +2725,101 @@ function simulateManagerMatch() {
 }
 function saveAndRender() { saveState(); render(); }
 function chooseTeam(teamId) { stopAdvance(); lastLoadError = null; state = buildInitialState(teamId, START_YEAR, Boolean(document.getElementById("zeroStatsOption")?.checked), selectedLeagueId || "BR"); createSoloSlot("club"); activeView = "home"; selectedTeamId = null; marketTab = "buy"; confirmReset = false; saveAndRender(); }
+function shuffledPool(list) { return list.slice().sort(() => Math.random() - 0.5); }
+function applyClubReplacement(replaceId, name) {
+  const team = teamById(replaceId);
+  const cleanName = (name || "").trim().slice(0, 40);
+  if (!team || !cleanName) return null;
+  const pool = state.players.filter((p) => (p.TeamID === "FREE" && p.leagueId === team.leagueId) || p.TeamID === replaceId);
+  const used = new Set();
+  const picked = [];
+  [["Chaser", 5], ["Beater", 4], ["Keeper", 2], ["Seeker", 2]].forEach(([position, count]) => {
+    shuffledPool(pool.filter((p) => !used.has(p.PlayerID) && (p.Position === position || p.Position === "Reserve")))
+      .slice(0, count).forEach((p) => { used.add(p.PlayerID); picked.push(p); });
+  });
+  shuffledPool(pool.filter((p) => !used.has(p.PlayerID))).slice(0, Math.max(0, 15 - picked.length))
+    .forEach((p) => { used.add(p.PlayerID); picked.push(p); });
+  if (picked.length < 7) return null;
+  const oldName = team.Name;
+  pool.forEach((p) => { if (!used.has(p.PlayerID)) { p.TeamID = "FREE"; p.listed = false; } });
+  picked.forEach((p) => { p.TeamID = replaceId; p.leagueId = team.leagueId; p.listed = false; p.negotiationBlockedUntil = null; });
+  team.Name = cleanName;
+  team.leagueTitles = 0; team.cupTitles = 0; team.euroCupTitles = 0; team.championsTitles = 0;
+  team.ReputationStars = 3;
+  team.OVR = Math.round(picked.reduce((sum, p) => sum + rating(p), 0) / Math.max(1, picked.length));
+  state.selectedLineups[replaceId] = defaultLineup(picked);
+  return { oldName, squadSize: picked.length };
+}
+function startCustomClub(leagueId, replaceId, name) {
+  stopAdvance();
+  lastLoadError = null;
+  state = buildInitialState(null, START_YEAR, Boolean(document.getElementById("zeroStatsOption")?.checked), leagueId);
+  const done = applyClubReplacement(replaceId, name);
+  if (!done) return false;
+  createSoloSlot("club");
+  state.managerTeamId = replaceId;
+  customClub = null;
+  customClubError = "";
+  activeView = "home";
+  selectedTeamId = null;
+  marketTab = "buy";
+  homeMode = "league";
+  confirmReset = false;
+  pushFeed(`${_("Fundas tu propio club:", "You found your own club:")} ${teamName(replaceId)} (${_("ocupa el lugar de", "takes the place of")} ${done.oldName}). ${_("Plantilla de", "Squad of")} ${done.squadSize} ${_("jugadores del mercado y del club desaparecido.", "players from the market and the folded club.")}`, `${_("You found your own club:")} ${teamName(replaceId)} (${_("takes the place of", "takes the place of")} ${done.oldName}).`);
+  saveAndRender();
+  return true;
+}
+function customClick(kind) {
+  if (kind === "open") {
+    customClub = { name: "", leagueId: selectedLeagueId || "BR", replaceId: "" };
+    customClubError = "";
+    render();
+  }
+  else if (kind === "back") { customClub = null; customClubError = ""; render(); }
+  else if (kind === "create") {
+    if (!customClub) return;
+    if (!startCustomClub(customClub.leagueId, customClub.replaceId, customClub.name)) {
+      customClubError = _("Ponle un nombre, elige a quién sustituye y reintenta (hacen falta al menos 7 jugadores entre mercado y club).", "Give it a name, pick who it replaces and retry (at least 7 players needed between market and club).");
+      render();
+    }
+  }
+}
+function customInput(field, input) {
+  if (!customClub) return;
+  if (field === "name") customClub.name = input.value;
+  else if (field === "league") { customClub.leagueId = input.value; customClub.replaceId = ""; render(); }
+  else if (field === "replace") customClub.replaceId = input.value;
+}
+function renderCustomClub() {
+  const league = leagueById((customClub && customClub.leagueId) || "BR");
+  const teams = leagueTeamsPreview(league);
+  return `
+    <main class="screen">
+      <div class="title-row">
+        <div>
+          <h1>${_("Crea tu propio club", "Create your own club")}</h1>
+          <p class="muted">${_("Elige liga, nombre y a qué equipo sustituye (se mantiene el número de equipos). Su plantilla se forma al azar con jugadores del mercado y del club desaparecido.", "Pick a league, a name and which team it replaces (team count stays). Its squad is drawn randomly from market players and the folded club.")}</p>
+        </div>
+        <div class="title-side" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+          ${langSelector()}
+          <button data-custom-club="back">← ${_("Volver", "Back")}</button>
+        </div>
+      </div>
+      ${customClubError ? `<div class="panel" style="border-color:#c0392b; margin-bottom:16px"><p style="color:#c0392b">${customClubError}</p></div>` : ""}
+      <section class="panel">
+        <div class="form-row">
+          <label>${_("Nombre del club", "Club name")}: <input data-custom-input="name" value="${((customClub && customClub.name) || "").replace(/"/g, "&quot;")}" maxlength="40" style="min-width:220px" /></label>
+          <label>${_("Liga", "League")}: <select data-custom-input="league">${LEAGUES.map((l) => `<option value="${l.id}" ${league.id === l.id ? "selected" : ""}>${l.name}</option>`).join("")}</select></label>
+          <label>${_("Sustituye a", "Replaces")}: <select data-custom-input="replace">
+            <option value="">—</option>
+            ${teams.map((t) => `<option value="${t.TeamID}" ${(customClub && customClub.replaceId) === t.TeamID ? "selected" : ""}>${t.Name} (OVR ${t.realOVR})</option>`).join("")}
+          </select></label>
+          <button data-custom-club="create" class="primary">${_("Fundar club y jugar", "Found club & play")}</button>
+        </div>
+      </section>
+    </main>
+  `;
+}
 function chooseLeague(leagueId) { selectedLeagueId = leagueById(leagueId).id; saveState(); render(); }
 
 function teamRecentSuccess(team) {
@@ -2860,6 +2961,7 @@ function acceptNegotiationCounter() {
   saveAndRender();
 }
 
+function clearNegotiation() { state.negotiation = null; saveAndRender(); }
 function withdrawNegotiation() {
   const neg = state.negotiation;
   const player = neg && playerById(neg.playerId);
@@ -3000,6 +3102,7 @@ function render() {
   if (globalThis.__qmHeadless) return;
   try {
     if (savesMenu) { app.innerHTML = renderSavesMenu(); bindEvents(); return; }
+    if (customClub) { app.innerHTML = renderCustomClub(); bindEvents(); return; }
     if (careerSetup) { app.innerHTML = renderCareerSetup(); bindEvents(); return; }
     if (state.careerMode) { renderCareer(); return; }
 if (!state.managerTeamId) {
@@ -3093,6 +3196,7 @@ function renderTeamSelect() {
       </div>
       <div class="form-row">
         <button data-load-file class="primary" title="${_("Cargar una partida guardada en un archivo", "Load a saved game from a file")}">${_("Cargar partida guardada", "Load saved game")}</button>
+        <button data-custom-club="open" class="primary" title="${_("Funda tu propio club: sustituye a un equipo de esta liga con una plantilla al azar", "Found your own club: replace a team from this league with a random squad")}">${_("Crear tu propio club", "Create your own club")}</button>
         <button data-back-league>← ${_("Cambiar de liga", "Change league")}</button>
       </div>
       <label class="option-check">
@@ -3185,7 +3289,7 @@ function renderWorldCupHome() {
                 ${rows.map((row, index) => `
                   <tr data-wc-team="${row.teamId}" class="clickable">
                     <td class="rank">${index + 1}</td>
-                    <td>${row.name}${row.teamId === state.managerTeamId ? " <span class='status-good'>★</span>" : ""}</td>
+                    <td>${row.name}${row.teamId === state.managerTeamId ? " <span class='status-good'>★</span>" : ""}${humanBadge(row.teamId)}</td>
                     <td>${row.played}</td><td>${row.wins}</td><td>${row.draws}</td><td>${row.losses}</td>
                     <td>${row.for}</td><td>${row.against}</td><td>${row.diff}</td><td><b>${row.points}</b></td>
                   </tr>`).join("")}
@@ -3498,7 +3602,7 @@ function renderEuroHome() {
                 ${rows.map((row, index) => `
                   <tr data-open-team="${row.teamId}" class="clickable">
                     <td class="rank">${index + 1}</td>
-                    <td>${row.name}${row.teamId === state.managerTeamId ? " <span class='status-good'>★</span>" : ""}</td>
+                    <td>${row.name}${row.teamId === state.managerTeamId ? " <span class='status-good'>★</span>" : ""}${humanBadge(row.teamId)}</td>
                     <td>${row.played}</td><td>${row.wins}</td><td>${row.draws}</td><td>${row.losses}</td>
                     <td>${row.for}</td><td>${row.against}</td><td>${row.diff}</td><td><b>${row.points}</b></td>
                   </tr>`).join("")}
@@ -3519,7 +3623,7 @@ function renderLeagueTable(showPrizes = false) {
         <tbody>
           ${state.standings.map((row, index) => `
             <tr class="clickable${index < euroSpots ? " euro-qualified" : ""}" data-open-team="${row.teamId}">
-              <td class="rank">${index + 1}</td><td>${row.name}</td><td>${row.played}</td><td>${row.wins}</td><td>${row.draws}</td><td>${row.losses}</td><td>${row.for}</td><td>${row.against}</td><td>${row.diff}</td><td><b>${row.points}</b></td>${showPrizes ? `<td>${money(leaguePrizeFor(index + 1))}</td>` : ""}
+              <td class="rank">${index + 1}</td><td>${row.name}${humanBadge(row.teamId)}</td><td>${row.played}</td><td>${row.wins}</td><td>${row.draws}</td><td>${row.losses}</td><td>${row.for}</td><td>${row.against}</td><td>${row.diff}</td><td><b>${row.points}</b></td>${showPrizes ? `<td>${money(leaguePrizeFor(index + 1))}</td>` : ""}
             </tr>
           `).join("")}
         </tbody>
@@ -3947,7 +4051,7 @@ function renderTitles() {
               ${rows.map((row, index) => `
                 <tr class="clickable" data-open-team="${row.TeamID}">
                   <td class="rank">${index + 1}</td>
-                  <td><b>${row.Name}</b></td>
+                  <td><b>${row.Name}</b>${humanBadge(row.TeamID)}</td>
                   <td>${isIntl ? leagueById(row.leagueId || state.leagueId).name : row.Country}</td>
                   <td${hl("league")}><b>${row.leagueTitles}</b></td>
                   <td${hl("cup")}>${row.cupTitles}</td>
@@ -5653,8 +5757,8 @@ function bindEvents() {
   }
   app.querySelectorAll("[data-offer-accept]").forEach((button) => { button.addEventListener("click", () => { acceptNegotiationCounter(); onlineEcho("acceptNegotiationCounter", []); }); });
   app.querySelectorAll("[data-offer-withdraw]").forEach((button) => { button.addEventListener("click", () => { withdrawNegotiation(); onlineEcho("withdrawNegotiation", []); }); });
-  app.querySelectorAll("[data-offer-cancel]").forEach((button) => { button.addEventListener("click", () => { state.negotiation = null; render(); }); });
-  app.querySelectorAll("[data-offer-close]").forEach((button) => { button.addEventListener("click", () => { state.negotiation = null; saveAndRender(); }); });
+  app.querySelectorAll("[data-offer-cancel]").forEach((button) => { button.addEventListener("click", () => { clearNegotiation(); onlineEcho("clearNegotiation", []); }); });
+  app.querySelectorAll("[data-offer-close]").forEach((button) => { button.addEventListener("click", () => { clearNegotiation(); onlineEcho("clearNegotiation", []); }); });
   app.querySelectorAll("[data-market-tab]").forEach((button) => { button.addEventListener("click", () => { marketTab = button.dataset.marketTab; render(); }); });
   app.querySelectorAll("[data-feed-tab]").forEach((button) => { button.addEventListener("click", () => { homeFeedTab = button.dataset.feedTab; render(); }); });
   app.querySelectorAll("[data-renew]").forEach((button) => { button.addEventListener("click", () => { renewContract(button.dataset.renew); onlineEcho("renewContract", [button.dataset.renew]); }); });
@@ -5763,6 +5867,8 @@ function bindEvents() {
 }
 
 document.addEventListener("click", (event) => {
+  const customClubButton = event.target.closest("[data-custom-club]");
+  if (customClubButton) { customClick(customClubButton.dataset.customClub); return; }
   const saveButton = event.target.closest("[data-save]");
   if (saveButton) { savesClick(saveButton.dataset.save, saveButton); return; }
   const onlineButton = event.target.closest("[data-online]");
@@ -5775,6 +5881,8 @@ document.addEventListener("click", (event) => {
 document.addEventListener("change", (event) => {
   const input = event.target.closest("[data-online-input]");
   if (input) onlineInput(input.dataset.onlineInput, input);
+  const customField = event.target.closest("[data-custom-input]");
+  if (customField) customInput(customField.dataset.customInput, customField);
 });
 
 if (!globalThis.__qmHeadless) render();
@@ -5792,6 +5900,7 @@ globalThis.__qm = {
   buyPlayer, sellPlayer, sellPlayerToLeague, shieldPlayer, renewContract,
   promoteStarter, demoteStarter, startNegotiation, startIntlNegotiation,
   submitNegotiation, acceptNegotiationCounter, withdrawNegotiation,
+  clearNegotiation,
 };
 
 window.setInterval(() => { saveState(); }, 10000);
@@ -5937,10 +6046,15 @@ function onlineConnect(autoJoin) {
       onlineError = "";
       onlineReconnects = 0;
       onlineDeleteArmed = false;
+      const incomingRoomId = (msg.room && msg.room.id) || null;
+      const firstJoin = !onlineRoomId || (incomingRoomId && incomingRoomId !== onlineRoomId);
+      const keepResult = state.onlineAuto ? state.lastResult : null;
       state = msg.state;
+      if (keepResult && !state.lastResult) state.lastResult = keepResult;
       onlineMyTeam = msg.myTeam;
       state.managerTeamId = onlineMyTeam;
-      onlineRoomId = (msg.room && msg.room.id) || onlineRoomId;
+      state.negotiation = (state.onlineNegs && state.onlineNegs[onlineMyTeam]) || null;
+      onlineRoomId = incomingRoomId || onlineRoomId;
       onlineRoomName = (msg.room && msg.room.name) || "";
       if (msg.managerToken || msg.creatorToken) {
         onlineTokens[onlineRoomId] = {
@@ -5961,11 +6075,13 @@ function onlineConnect(autoJoin) {
       }
       if (savesMenu) return;
       onlineLobby = false;
-      activeView = "home";
-      selectedTeamId = null;
-      selectedPlayerId = null;
-      marketTab = "buy";
-      homeMode = "league";
+      if (firstJoin) {
+        activeView = "home";
+        selectedTeamId = null;
+        selectedPlayerId = null;
+        marketTab = "buy";
+        homeMode = "league";
+      }
       render();
     }
     else if (msg.t === "error" && msg.error) {
@@ -6060,7 +6176,19 @@ function savesClick(kind, el) {
   else if (kind === "load") { savesMessage = ""; loadSaveSlot(el.dataset.id); }
   else if (kind === "delete") {
     const id = el.dataset.id;
+    const meta = loadSavesIndex().slots.find((s) => s.id === id);
     const wasCurrent = id === currentSaveId;
+    // Online: borrar del menú solo desvincula TU acceso (sales de la
+    // sala pero sigue abierta para reentrar). Borrarla de verdad se hace
+    // desde dentro con "Borrar sala" (creador).
+    if (meta && meta.mode === "online" && meta.ref && meta.ref.roomId === onlineRoomId) {
+      onlineDisconnect();
+      stopAdvance();
+      state = buildInitialState();
+      activeView = "home";
+      selectedTeamId = null;
+      savesMenu = true;
+    }
     deleteSaveSlot(id);
     if (wasCurrent && state.managerTeamId && !state.onlineAuto) {
       stopAdvance();
@@ -6104,8 +6232,8 @@ function renderSavesMenu() {
               ? `${_("Sala", "Room")} ${slot.name} · ${teamName(slot.team) || slot.team}${slot.date ? " · " + formatDate(slot.date, true) : ""}`
               : `${slot.team ? teamName(slot.team) : ""}${slot.date ? " · " + formatDate(slot.date, true) : ""}`} · ${relTime(slot.updatedAt)}</p>
             <div class="form-row">
-              <button data-save="load" data-id="${slot.id}" class="primary">${_("Jugar", "Play")}</button>
-              <button data-save="delete" data-id="${slot.id}" class="danger">${_("Borrar", "Delete")}</button>
+              <button data-save="load" data-id="${slot.id}" class="primary">${slot.mode === "online" ? _("Reentrar", "Rejoin") : _("Jugar", "Play")}</button>
+              <button data-save="delete" data-id="${slot.id}" class="danger" title="${slot.mode === "online" ? _("Quitar de tu lista (la sala sigue abierta)", "Remove from your list (the room stays open)") : _("Borrar la partida", "Delete the game")}">${slot.mode === "online" ? _("Quitar", "Remove") : _("Borrar", "Delete")}</button>
             </div>
           </div>`).join("") : `<p class="muted">${_("Aún no hay partidas. Crea una nueva o entra online.", "No games yet. Start a new one or go online.")}</p>`}
       </section>
@@ -6125,6 +6253,8 @@ function renderOnlineLobby() {
   const createLeague = leagueById(onlineCreate.leagueId) || leagueById("BR");
   const createTeams = leagueTeamsPreview(createLeague);
   const myOnlineSlots = loadSavesIndex().slots.filter((s) => s.mode === "online" && s.ref);
+  const myRoomIds = new Set(myOnlineSlots.map((s) => s.ref.roomId));
+  const openRooms = onlineRooms.filter((room) => !myRoomIds.has(room.id));
   return `
     <main class="screen">
       <div class="title-row">
@@ -6178,8 +6308,8 @@ function renderOnlineLobby() {
         </div>
       </section>
       <section class="panel">
-        <div class="title-row"><h2>${_("Salas abiertas", "Open rooms")}</h2><span class="pill">${onlineRooms.length}</span></div>
-        ${onlineRooms.length ? onlineRooms.map((room) => {
+        <div class="title-row"><h2>${_("Salas abiertas", "Open rooms")}</h2><span class="pill">${openRooms.length}</span></div>
+        ${openRooms.length ? openRooms.map((room) => {
           const teams = onlineRoomTeams(room);
           const myNick = (onlineNick || "").trim().toLowerCase();
           const ownerOf = (teamId) => (room.managers || []).find((m) => m.teamId === teamId);
