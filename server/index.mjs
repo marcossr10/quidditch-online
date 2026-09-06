@@ -3,9 +3,10 @@
 import http from "http";
 import { WebSocketServer } from "ws";
 import { LEAGUES } from "./harness.mjs";
-import { loadAllRooms, createRoom, addManager, tickRoom, applyAction, saveRoom, roomInfo } from "./rooms.mjs";
+import { loadAllRooms, createRoom, addManager, tickRoom, applyAction, saveRoom, roomInfo, deleteRoomFile, newToken } from "./rooms.mjs";
 
 const PORT = Number(process.env.PORT || 8787);
+const SERVER_VERSION = "1.8.0";
 const TICK_MS = 5000;
 const SAVE_MS = 15000;
 const MIN_DAY_MS = 15000;
@@ -23,10 +24,17 @@ for (const room of rooms.values()) {
 const send = (ws, obj) => { if (ws.readyState === 1) ws.send(JSON.stringify(obj)); };
 const broadcastRooms = () => {
   const list = [...rooms.values()].map(roomInfo);
-  for (const room of rooms.values()) for (const ws of room.sockets) send(ws, { t: "rooms", rooms: list });
-  for (const ws of lobby) send(ws, { t: "rooms", rooms: list });
+  for (const room of rooms.values()) for (const ws of room.sockets) send(ws, { t: "rooms", rooms: list, serverVersion: SERVER_VERSION });
+  for (const ws of lobby) send(ws, { t: "rooms", rooms: list, serverVersion: SERVER_VERSION });
 };
-const snapshot = (room, teamId) => ({ t: "snapshot", room: roomInfo(room), myTeam: teamId, state: room.state });
+// El snapshot lleva los resultados pendientes de TU equipo y los
+// limpia al enviar (si estás conectado, el envío es fiable; si no lo
+// estás, se acumulan hasta que reentres).
+const snapshot = (room, teamId) => {
+  const pending = room.queues?.[teamId] || [];
+  room.queues[teamId] = [];
+  return { t: "snapshot", room: roomInfo(room), myTeam: teamId, state: room.state, pendingResults: pending };
+};
 
 const server = http.createServer((req, res) => {
   if (req.url === "/rooms") {
@@ -35,7 +43,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ ok: true, game: "quidditch-manager-online", rooms: rooms.size, uptime: process.uptime() }));
+  res.end(JSON.stringify({ ok: true, game: "quidditch-manager-online", version: SERVER_VERSION, rooms: rooms.size, uptime: process.uptime() }));
 });
 
 const wss = new WebSocketServer({ server, perMessageDeflate: true });
@@ -44,7 +52,7 @@ const lobby = new Set(); // sockets mirando la lista de salas
 wss.on("connection", (ws) => {
   ws.meta = {}; // { roomId, teamId, nick }
   lobby.add(ws);
-  send(ws, { t: "rooms", rooms: [...rooms.values()].map(roomInfo) });
+  send(ws, { t: "rooms", rooms: [...rooms.values()].map(roomInfo), serverVersion: SERVER_VERSION });
 
   ws.on("message", (raw) => {
     let msg;
@@ -56,14 +64,17 @@ wss.on("connection", (ws) => {
       const leagueId = String(msg.leagueId || "BR");
       if (!LEAGUES.some((l) => l.id === leagueId)) return send(ws, { t: "error", error: "LIGA_INVALIDA" });
       const dayMs = Math.min(MAX_DAY_MS, Math.max(MIN_DAY_MS, Number(msg.dayMs) || 120000));
-      const nick = String(msg.nick || "Mánager").slice(0, 24);
-      const room = createRoom({ name, leagueId, dayMs, managerName: null, teamId: null });
+      const nick = String(msg.nick || "Mánager").trim().slice(0, 24) || "Mánager";
+      const room = createRoom({ name, leagueId, dayMs, managerName: nick, teamId: null });
       rooms.set(room.id, room);
       room.lastSave = Date.now();
-      const r = addManager(room, nick, String(msg.teamId || ""));
+      const r = addManager(room, nick, String(msg.teamId || ""), null);
       if (!r.ok) { rooms.delete(room.id); return send(ws, { t: "error", error: r.error }); }
       attach(ws, room, nick, String(msg.teamId));
-      send(ws, snapshot(room, String(msg.teamId)));
+      const snap = snapshot(room, String(msg.teamId));
+      snap.managerToken = r.token;
+      snap.creatorToken = room.creatorToken;
+      send(ws, snap);
       broadcastRooms();
       return;
     }
@@ -71,17 +82,35 @@ wss.on("connection", (ws) => {
     if (msg.t === "join") {
       const room = rooms.get(String(msg.roomId || ""));
       if (!room) return send(ws, { t: "error", error: "SALA_NO_EXISTE" });
-      const nick = String(msg.nick || "Mánager").slice(0, 24);
+      const nick = String(msg.nick || "Mánager").trim().slice(0, 24) || "Mánager";
       const teamId = String(msg.teamId || "");
-      const existing = room.managers.find((m) => m.teamId === teamId);
-      if (existing && existing.name !== nick) return send(ws, { t: "error", error: "EQUIPO_OCUPADO" });
-      if (!existing) {
-        const r = addManager(room, nick, teamId);
-        if (!r.ok) return send(ws, { t: "error", error: r.error });
-        saveRoom(room);
+      // Salas creadas antes de los tokens: el primer mánager (quien la
+      // creó en la práctica) adopta el rol de creador al reentrar.
+      if (!room.creatorToken && room.managers[0] && room.managers[0].name.toLowerCase() === nick.toLowerCase()) {
+        room.creatorToken = newToken();
+        room.creatorNick = room.managers[0].name;
       }
+      const r = addManager(room, nick, teamId, msg.token ? String(msg.token) : null);
+      if (!r.ok) return send(ws, { t: "error", error: r.error });
+      saveRoom(room);
       attach(ws, room, nick, teamId);
-      send(ws, snapshot(room, teamId));
+      const snap = snapshot(room, teamId);
+      snap.managerToken = r.token;
+      if (room.creatorNick && room.creatorNick.toLowerCase() === nick.toLowerCase()) snap.creatorToken = room.creatorToken;
+      send(ws, snap);
+      broadcastRooms();
+      return;
+    }
+
+    if (msg.t === "delete") {
+      const room = rooms.get(String(msg.roomId || ""));
+      if (!room) return send(ws, { t: "error", error: "SALA_NO_EXISTE" });
+      if (!room.creatorToken || msg.creatorToken !== room.creatorToken) {
+        return send(ws, { t: "error", error: "SOLO_CREADOR" });
+      }
+      for (const peer of room.sockets) send(peer, { t: "roomDeleted", roomId: room.id });
+      rooms.delete(room.id);
+      deleteRoomFile(room.id);
       broadcastRooms();
       return;
     }

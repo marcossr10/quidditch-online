@@ -8,7 +8,7 @@
 //   de la fecha del juego cuántos días simular: el reloj manda.
 // - Al despertar (tras dormir Render o reinicio), el tick calcula owed
 //   con el reloj y hace catch-up: parece 24/7 sin serlo.
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, unlinkSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { qm } from "./harness.mjs";
@@ -29,15 +29,21 @@ function atomicWrite(path, text) {
   renameSync(tmp, path);
 }
 
+export const newToken = () => Math.random().toString(36).slice(2, 14);
+
 export function saveRoom(room) {
   atomicWrite(roomPath(room.id), JSON.stringify({
-    version: 1,
+    version: 2,
     meta: {
       id: room.id, name: room.name, leagueId: room.leagueId,
       dayMs: room.dayMs, createdAt: room.createdAt,
       managers: room.managers,
+      creatorToken: room.creatorToken || null,
+      creatorNick: room.creatorNick || null,
     },
     lastTickWall: room.lastTickWall,
+    knownPlayed: room.knownPlayed || [],
+    queues: room.queues || {},
     state: room.state,
   }));
 }
@@ -65,9 +71,14 @@ export function loadAllRooms() {
       id, name: raw.meta.name, leagueId: raw.meta.leagueId,
       dayMs: raw.meta.dayMs, createdAt: raw.meta.createdAt,
       managers: raw.meta.managers || [],
+      creatorToken: raw.meta.creatorToken || null,
+      creatorNick: raw.meta.creatorNick || null,
       lastTickWall: Math.min(raw.lastTickWall || Date.now(), Date.now()),
+      knownPlayed: Array.isArray(raw.knownPlayed) ? raw.knownPlayed : raw.state.fixtures.filter((f) => f.played).map((f) => f.id),
+      queues: raw.queues && typeof raw.queues === "object" ? raw.queues : {},
       state: raw.state, sockets: new Set(), dirty: false,
     };
+    room.knownSet = new Set(room.knownPlayed);
     // Reafirmar modo online tras cargar (por si migrateState lo tocó)
     room.state.onlineAuto = true;
     room.state.managerTeamId = null;
@@ -82,6 +93,8 @@ export function createRoom({ name, leagueId, dayMs, managerName, teamId }) {
   const room = {
     id: rid(), name, leagueId, dayMs, createdAt: Date.now(),
     managers: [], lastTickWall: Date.now(), state,
+    creatorToken: newToken(), creatorNick: managerName || null,
+    knownPlayed: [], knownSet: new Set(), queues: {},
     sockets: new Set(), dirty: true,
   };
   state.onlineAuto = true;
@@ -93,14 +106,33 @@ export function createRoom({ name, leagueId, dayMs, managerName, teamId }) {
   return room;
 }
 
-export function addManager(room, name, teamId) {
-  if (room.managers.some((m) => m.teamId === teamId)) return { ok: false, error: "EQUIPO_OCUPADO" };
+export function addManager(room, name, teamId, token = null) {
+  const nick = String(name || "").trim().slice(0, 24) || "Mánager";
+  const claim = room.managers.find((m) => m.teamId === teamId);
+  if (claim) {
+    // El equipo ya tiene dueño: solo reentra el mismo mánager (mismo
+    // nombre). El nombre es la identidad: se guarda y se reconoce.
+    // Si trae token nuevo se actualiza; sin token también entra.
+    if (claim.name.toLowerCase() !== nick.toLowerCase()) return { ok: false, error: "EQUIPO_OCUPADO" };
+    if (token) claim.token = token;
+    room.dirty = true;
+    return { ok: true, token: claim.token || null };
+  }
   const team = room.state.teams.find((t) => t.TeamID === teamId && t.leagueId === room.leagueId);
   if (!team) return { ok: false, error: "EQUIPO_INVALIDO" };
-  room.managers.push({ name, teamId });
+  // Un mánager, un equipo: no se puede cambiar de equipo en la misma sala.
+  if (room.managers.some((m) => m.name.toLowerCase() === nick.toLowerCase())) {
+    return { ok: false, error: "YA_TIENES_EQUIPO" };
+  }
+  const entry = { name: nick, teamId, token: token || newToken() };
+  room.managers.push(entry);
   room.state.onlineManagers = room.managers.map((m) => m.teamId);
   room.dirty = true;
-  return { ok: true };
+  return { ok: true, token: entry.token };
+}
+
+export function deleteRoomFile(id) {
+  try { unlinkSync(roomPath(id)); } catch {}
 }
 
 // Un tick del reloj: devuelve nº de días simulados.
@@ -122,6 +154,23 @@ export function tickRoom(room, now = Date.now()) {
   }
   room.lastTickWall += days * room.dayMs;
   room.dirty = true;
+  // Avisar resultados: partidos recién jugados de equipos humanos van
+  // a su cola (el cliente los muestra en el popup, en vivo o al reentrar).
+  if (!room.knownSet) room.knownSet = new Set(room.knownPlayed || []);
+  const humans = new Set(room.managers.map((m) => m.teamId));
+  for (const fixture of room.state.fixtures) {
+    if (!fixture.played || room.knownSet.has(fixture.id)) continue;
+    room.knownSet.add(fixture.id);
+    if (!humans.has(fixture.homeId) && !humans.has(fixture.awayId)) continue;
+    const copy = JSON.parse(JSON.stringify(fixture));
+    for (const teamId of [fixture.homeId, fixture.awayId]) {
+      if (!humans.has(teamId)) continue;
+      room.queues[teamId] = room.queues[teamId] || [];
+      room.queues[teamId].push(copy);
+      if (room.queues[teamId].length > 15) room.queues[teamId] = room.queues[teamId].slice(-15);
+    }
+  }
+  room.knownPlayed = [...room.knownSet];
   return days;
 }
 
@@ -178,6 +227,7 @@ export function roomInfo(room) {
     id: room.id, name: room.name, leagueId: room.leagueId,
     dayMs: room.dayMs, createdAt: room.createdAt,
     date: room.state.currentDate, seasonYear: room.state.seasonYear,
+    creatorNick: room.creatorNick || null,
     managers: room.managers.map((m) => ({ name: m.name, teamId: m.teamId })),
   };
 }

@@ -6,13 +6,13 @@ const SAVE_KEY = "quidditch-manager-save-v2";
 const SAVE_BACKUP_KEY = "quidditch-manager-save-backup";
 const CAREER_SAVE_KEY = "quidditch-career-save-v1";
 const CAREER_BACKUP_KEY = "quidditch-career-save-backup";
-const GAME_VERSION = "1.4.0";
+const GAME_VERSION = "1.8.0";
 const START_YEAR = 2025;
 
 // --- Estado de sesión online (declarado arriba: render() lo lee al arrancar) ---
 // PON AQUÍ la dirección de tu servidor en Render cuando lo despliegues.
 // Tus amigos no tendrán que escribir nada: en itch.io se usa sola.
-const ONLINE_PROD_URL = "wss://TU-SERVIDOR.onrender.com";
+const ONLINE_PROD_URL = "wss://quidditch-online.onrender.com";
 function onlineDefaultUrl() {
   try {
     if (typeof location === "undefined") return "ws://localhost:8787";
@@ -35,6 +35,24 @@ let onlineErrorAt = 0;
 let onlineReconnects = 0;
 let onlineCreate = { name: "", leagueId: "BR", teamId: "", daySec: 120 };
 let onlineJoinTeam = {};
+let onlinePendingJoin = null;
+let onlineConnecting = false;
+let onlineOpened = false;
+let onlineServerVersion = "";
+let onlineResults = [];
+let onlineTokens = {};
+let onlineDeleteArmed = false;
+
+// --- Partidas guardadas (slots): varias partidas en paralelo + menú ---
+// Índice ligero en una clave; cada partida en su propia clave (los estados
+// pesan ~2 MB y el autoguardado solo reescribe el slot actual).
+const QM_SAVES_INDEX = "quidditch-manager-saves-v1";
+const QM_SLOT_PREFIX = "quidditch-manager-slot-";
+const QM_MAX_SLOTS = 6;
+let savesMenu = false;
+let currentSaveId = null;
+let savesMessage = "";
+let saveSlotsCache = {};
 
 // --- Internacionalización (i18n) ---
 // Idiomas disponibles: inglés (en) y español (es). Por defecto el juego arranca en inglés.
@@ -85,10 +103,9 @@ const app = document.querySelector("#app");
 let lastLoadError = null;
 let state = buildInitialState();
 try {
-  const loaded = loadState();
-  if (loaded) state = loaded;
+  bootSaves();
 } catch (bootError) {
-  console.error("No se pudo restaurar el guardado al arrancar:", bootError);
+  console.error("No se pudo restaurar los guardados al arrancar:", bootError);
 }
 if (state && state.managerTeamId && !state.worldCup) {
   try { stabilizeAiFinances(); } catch (bailoutError) { console.error("Saneo financiero falló al arrancar:", bailoutError); }
@@ -634,13 +651,181 @@ function loadState() {
   return buildInitialState();
 }
 function saveState() {
-  if (globalThis.__qmHeadless || state.onlineAuto) return;
-  try {
-    localStorage.setItem(state.careerMode ? CAREER_SAVE_KEY : SAVE_KEY, JSON.stringify(state));
-  } catch (error) {
-    console.error("No se pudo guardar la partida:", error);
-    pushFeed(_("AVISO: no se pudo guardar la partida automáticamente. Usa el botón \"Guardar\" para exportarla a un archivo.", "WARNING: the game could not be saved automatically. Use the \"Save\" button to export it to a file."), _("AVISO: no se pudo guardar la partida automáticamente. Usa el botón \"Guardar\" para exportarla a un archivo.", "WARNING: the game could not be saved automatically. Use the \"Save\" button to export it to a file."));
+  if (globalThis.__qmHeadless || state.onlineAuto || !state.managerTeamId) return;
+  const slot = getSaveSlot(currentSaveId);
+  if (!slot || slot.mode === "online") {
+    if (!createSoloSlot(state.careerMode ? "career" : "club")) return;
+  } else {
+    slot.state = state;
+    refreshSlotMeta(slot);
   }
+  persistSaves();
+}
+function loadSavesIndex() {
+  try {
+    const raw = localStorage.getItem(QM_SAVES_INDEX);
+    if (!raw) return { currentId: null, slots: [] };
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.slots)) return { currentId: null, slots: [] };
+    return { currentId: parsed.currentId || null, slots: parsed.slots };
+  } catch { return { currentId: null, slots: [] }; }
+}
+function persistSavesIndex() {
+  const index = loadSavesIndex();
+  index.currentId = currentSaveId;
+  try { localStorage.setItem(QM_SAVES_INDEX, JSON.stringify(index)); } catch (e) { console.error("No se pudo guardar el índice de partidas:", e); }
+}
+function slotMetaFor(st, mode, ref) {
+  if (mode === "online") {
+    return {
+      name: (ref && ref.roomName) || (ref && ref.roomId) || _("Online", "Online"),
+      team: (ref && ref.teamId) || "",
+      date: (st && st.currentDate) || "",
+      seasonYear: (st && st.seasonYear) || null,
+    };
+  }
+  if (st && st.careerMode) {
+    const cp = (() => { try { return careerPlayer(); } catch { return null; } })();
+    return { name: (cp && cp.Name) || _("Carrera", "Career"), team: st.managerTeamId || "", date: st.currentDate || "", seasonYear: st.seasonYear || null };
+  }
+  return { name: teamName(st ? st.managerTeamId : null), team: (st && st.managerTeamId) || "", date: (st && st.currentDate) || "", seasonYear: (st && st.seasonYear) || null };
+}
+function refreshSlotMeta(slot) {
+  const meta = slotMetaFor(slot.mode === "online" ? null : slot.state, slot.mode, slot.ref);
+  slot.name = meta.name; slot.team = meta.team; slot.date = meta.date; slot.seasonYear = meta.seasonYear;
+  slot.updatedAt = Date.now();
+}
+function persistSaves() {
+  const index = loadSavesIndex();
+  const byId = Object.fromEntries(index.slots.map((s) => [s.id, s]));
+  for (const [id, slot] of Object.entries(saveSlotsCache)) {
+    byId[id] = { id, name: slot.name, mode: slot.mode, team: slot.team, date: slot.date, seasonYear: slot.seasonYear, updatedAt: slot.updatedAt, ref: slot.ref || null };
+    if (slot.mode !== "online") {
+      try { localStorage.setItem(QM_SLOT_PREFIX + id, JSON.stringify({ state: slot.state })); }
+      catch (e) { console.error("No se pudo guardar la partida:", e); savesMessage = _("Almacenamiento lleno: borra alguna partida para seguir guardando.", "Storage full: delete a game to keep saving."); return false; }
+    }
+  }
+  for (const id of Object.keys(byId)) { if (!saveSlotsCache[id]) delete byId[id]; }
+  index.slots = Object.values(byId).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  index.currentId = currentSaveId;
+  try { localStorage.setItem(QM_SAVES_INDEX, JSON.stringify(index)); }
+  catch (e) { console.error("No se pudo guardar el índice de partidas:", e); return false; }
+  return true;
+}
+function getSaveSlot(id) { return (id && saveSlotsCache[id]) || null; }
+function loadSlotPayload(id) {
+  try {
+    const raw = localStorage.getItem(QM_SLOT_PREFIX + id);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+function createSoloSlot(mode) {
+  const index = loadSavesIndex();
+  if (index.slots.length >= QM_MAX_SLOTS) { savesMessage = _("Tienes el máximo de partidas guardadas. Borra alguna para crear otra.", "You have the maximum number of saved games. Delete one to create another."); return null; }
+  const id = `s${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
+  const slot = { id, mode, state, ref: null, updatedAt: Date.now() };
+  refreshSlotMeta(slot);
+  saveSlotsCache[id] = slot;
+  currentSaveId = id;
+  persistSaves();
+  return id;
+}
+function upsertOnlineSlot(ref) {
+  const index = loadSavesIndex();
+  const found = index.slots.find((s) => s.mode === "online" && s.ref && s.ref.url === ref.url && s.ref.roomId === ref.roomId && s.ref.teamId === ref.teamId);
+  if (found) {
+    const slot = getSaveSlot(found.id) || { ...found };
+    slot.ref = ref;
+    refreshSlotMeta(slot);
+    saveSlotsCache[found.id] = slot;
+    currentSaveId = found.id;
+    persistSaves();
+    return found.id;
+  }
+  if (index.slots.length >= QM_MAX_SLOTS) { savesMessage = _("Tienes el máximo de partidas guardadas. Borra alguna para guardar esta.", "You have the maximum number of saved games. Delete one to save this one."); return null; }
+  const id = `o${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
+  const slot = { id, mode: "online", state: null, ref, updatedAt: Date.now() };
+  refreshSlotMeta(slot);
+  saveSlotsCache[id] = slot;
+  currentSaveId = id;
+  persistSaves();
+  return id;
+}
+function deleteSaveSlot(id, silent = false) {
+  const index = loadSavesIndex();
+  index.slots = index.slots.filter((s) => s.id !== id);
+  if (index.currentId === id) index.currentId = null;
+  try {
+    localStorage.setItem(QM_SAVES_INDEX, JSON.stringify(index));
+    localStorage.removeItem(QM_SLOT_PREFIX + id);
+  } catch (e) { console.error("No se pudo borrar la partida:", e); }
+  delete saveSlotsCache[id];
+  if (currentSaveId === id) currentSaveId = null;
+  if (!silent) savesMessage = "";
+}
+function loadSaveSlot(id) {
+  const index = loadSavesIndex();
+  const meta = index.slots.find((s) => s.id === id);
+  if (!meta) return false;
+  if (meta.mode === "online") {
+    if (!meta.ref) return false;
+    onlineUrl = meta.ref.url || onlineUrl;
+    onlineNick = meta.ref.nick || onlineNick;
+    if (meta.ref.managerToken || meta.ref.creatorToken) {
+      onlineTokens[meta.ref.roomId] = { manager: meta.ref.managerToken || null, creator: meta.ref.creatorToken || null };
+    }
+    onlinePendingJoin = { roomId: meta.ref.roomId, teamId: meta.ref.teamId, token: meta.ref.managerToken || null };
+    currentSaveId = id;
+    persistSavesIndex();
+    savesMenu = false;
+    onlineLobby = true;
+    onlineConnect(false);
+    return true;
+  }
+  const payload = loadSlotPayload(id);
+  if (!payload || !payload.state) { savesMessage = _("Esa partida está dañada y no se puede cargar.", "That game is corrupted and cannot be loaded."); return false; }
+  onlineDisconnect();
+  stopAdvance();
+  try { state = migrateState(payload.state); } catch { state = payload.state; }
+  let slot = getSaveSlot(id);
+  if (!slot) { slot = { ...meta, state }; saveSlotsCache[id] = slot; }
+  else slot.state = state;
+  currentSaveId = id;
+  refreshSlotMeta(slot);
+  persistSaves();
+  activeView = state.careerMode ? "career-home" : "home";
+  selectedTeamId = null;
+  selectedPlayerId = null;
+  marketTab = "buy";
+  homeMode = "league";
+  confirmReset = false;
+  savesMenu = false;
+  onlineLobby = false;
+  render();
+  return true;
+}
+function bootSaves() {
+  const index = loadSavesIndex();
+  if (!index.slots.length) {
+    // Migrar el guardado único antiguo (si existe) a slots, una sola vez.
+    let legacy = null;
+    try { legacy = loadState(); } catch (e) { console.error("migración legacy:", e); }
+    if (legacy && legacy.managerTeamId) {
+      state = legacy;
+      const id = createSoloSlot(legacy.careerMode ? "career" : "club");
+      if (id) {
+        try { localStorage.removeItem(SAVE_KEY); localStorage.removeItem(CAREER_SAVE_KEY); } catch (e) {}
+      }
+      state = buildInitialState();
+    }
+  }
+  // Hidratar la caché con los metadatos (los estados se leen al cargar cada slot).
+  const fresh = loadSavesIndex();
+  saveSlotsCache = {};
+  for (const meta of fresh.slots) saveSlotsCache[meta.id] = { ...meta, state: null };
+  currentSaveId = fresh.currentId;
+  savesMenu = fresh.slots.length > 0;
 }
 function exportGame() {
   const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
@@ -663,6 +848,7 @@ function importGameFile(file) {
       const parsed = migrateState(JSON.parse(reader.result));
       stopAdvance();
       state = parsed;
+      createSoloSlot(parsed.careerMode ? "career" : "club");
       activeView = "home";
       selectedTeamId = null;
       marketTab = "buy";
@@ -2532,7 +2718,7 @@ function simulateManagerMatch() {
   }, 2300);
 }
 function saveAndRender() { saveState(); render(); }
-function chooseTeam(teamId) { stopAdvance(); const prevSave = (() => { try { return localStorage.getItem(SAVE_KEY); } catch (e) { return null; } })(); if (prevSave) { try { localStorage.setItem(SAVE_BACKUP_KEY, prevSave); } catch (e) {} } localStorage.removeItem(SAVE_KEY); lastLoadError = null; state = buildInitialState(teamId, START_YEAR, Boolean(document.getElementById("zeroStatsOption")?.checked), selectedLeagueId || "BR"); activeView = "home"; selectedTeamId = null; marketTab = "buy"; confirmReset = false; saveAndRender(); }
+function chooseTeam(teamId) { stopAdvance(); lastLoadError = null; state = buildInitialState(teamId, START_YEAR, Boolean(document.getElementById("zeroStatsOption")?.checked), selectedLeagueId || "BR"); createSoloSlot("club"); activeView = "home"; selectedTeamId = null; marketTab = "buy"; confirmReset = false; saveAndRender(); }
 function chooseLeague(leagueId) { selectedLeagueId = leagueById(leagueId).id; saveState(); render(); }
 
 function teamRecentSuccess(team) {
@@ -2795,14 +2981,25 @@ function demoteStarter(playerId) {
   saveAndRender();
 }
 function resetGame() {
-  if (state.onlineAuto) return;
-  if (!confirmReset) { confirmReset = true; render(); return; }
   if (state.careerMode) { careerGameReset(); return; }
-  stopAdvance(); localStorage.removeItem(SAVE_KEY); state = buildInitialState(null, START_YEAR, false, state.leagueId || "BR"); activeView = "home"; selectedTeamId = null; marketTab = "buy"; confirmReset = false; render();
+  stopAdvance();
+  confirmReset = false;
+  savesMenu = true;
+  render();
+}
+function onlineDisconnect() {
+  onlineRoomId = null;
+  onlineMyTeam = null;
+  onlineRoomName = "";
+  onlinePendingJoin = null;
+  onlineReconnects = 0;
+  try { if (onlineSocket) onlineSocket.close(); } catch { /* noop */ }
+  onlineSocket = null;
 }
 function render() {
   if (globalThis.__qmHeadless) return;
   try {
+    if (savesMenu) { app.innerHTML = renderSavesMenu(); bindEvents(); return; }
     if (careerSetup) { app.innerHTML = renderCareerSetup(); bindEvents(); return; }
     if (state.careerMode) { renderCareer(); return; }
 if (!state.managerTeamId) {
@@ -2843,13 +3040,13 @@ if (!state.managerTeamId) {
         ${state.worldCup ? "" : navButton("market", _("Mercado", "Market"))}
         ${navButton("fixtures", _("Partidos", "Matches"))}
         ${navButton("team", _("Equipo", "Team"))}
-        <button data-action="reset" class="danger">${confirmReset ? _("Confirmar nueva partida", "Confirm new game") : _("Nueva partida", "New game")}</button>
-        ${confirmReset ? `<button data-action="cancel-reset">${_("Cancelar", "Cancel")}</button>` : ""}
+        <button data-action="reset" class="danger" title="${_("Tus partidas: cambiar, crear o borrar", "Your games: switch, create or delete")}">${_("Partidas", "Games")}</button>
         <button data-action="save-file" class="save-file" title="${_("Guardar partida en un archivo", "Save game to a file")}">${_("Guardar", "Save")}</button>
         <button data-action="load-file" class="save-file" title="${_("Cargar partida desde un archivo", "Load game from a file")}">${_("Cargar", "Load")}</button>
         <span class="nav-lang">${langSelector()}</span>
         ${navButton("titles", _("Títulos", "Titles"), "push-right")}
         ${state.onlineAuto ? `<button data-online="exit" class="danger" title="${_("Salir de la liga online", "Leave the online league")}">${_("Salir", "Leave")}</button>` : ""}
+        ${state.onlineAuto && onlineRoomId ? `<button data-online="delete-room" class="danger" title="${_("Borrar la sala (solo el creador)", "Delete the room (creator only)")}">${onlineDeleteArmed ? _("Confirmar borrado", "Confirm delete") : _("Borrar sala", "Delete room")}</button>` : ""}
       </nav>
       ${renderView()}
       ${renderAdvanceDock()}
@@ -2941,6 +3138,7 @@ function renderLeagueSelect() {
         <button data-load-file class="primary" title="${_("Cargar una partida guardada en un archivo", "Load a saved game from a file")}">${_("Cargar partida guardada", "Load saved game")}</button>
         <button data-career-start class="primary" title="${_("Juega como un único jugador: tu club lo gestiona la IA, tú entrenas, juegas, recibes ofertas y construyes tu leyenda.", "Play as a single player: your club is run by the AI, you train, play, receive offers and build your legend.")}">${_("Carrera de Jugador", "Player Career")}</button>
         <button data-online="open" class="primary" title="${_("Juega online: el tiempo avanza solo en el servidor, entra a ver la temporada y gestiona tu equipo en vivo.", "Play online: time advances on its own on the server, join to watch the season and manage your team live.")}">${_("Liga Online", "Online League")}</button>
+        ${loadSavesIndex().slots.length ? `<button data-save="menu">← ${_("Mis partidas", "My games")}</button>` : ""}
       </div>
       <section class="league-pick">
         ${LEAGUES.map((league) => `
@@ -4901,8 +5099,7 @@ function renderCareer() {
         ${nav("squad", _("Plantilla", "Squad"))}
         ${nav("career-league", _("Liga", "League"))}
         ${nav("fixtures", _("Partidos", "Matches"))}
-        <button data-action="reset" class="danger">${confirmReset ? _("Confirmar nueva partida", "Confirm new game") : _("Nueva partida", "New game")}</button>
-        ${confirmReset ? `<button data-action="cancel-reset">${_("Cancelar", "Cancel")}</button>` : ""}
+        <button data-action="reset" class="danger" title="${_("Tus partidas: cambiar, crear o borrar", "Your games: switch, create or delete")}">${_("Partidas", "Games")}</button>
         <button data-action="save-file" class="save-file">${_("Guardar", "Save")}</button>
         <button data-action="load-file" class="save-file">${_("Cargar", "Load")}</button>
         ${nav("titles", _("Títulos", "Trophies"), "push-right")}
@@ -5383,6 +5580,7 @@ function startCareerAtClub(clubId) {
   if (!playerRow || !clubId || !teamById(clubId)) return;
   stopAdvance();
   state = buildCareerState(playerRow, clubId);
+  createSoloSlot("career");
   careerSetup = null;
   careerSetupRandom = null;
   careerSetupCustom = null;
@@ -5395,9 +5593,8 @@ function startCareerAtClub(clubId) {
 }
 
 function careerGameReset() {
-  if (!confirmReset) { confirmReset = true; render(); return; }
   stopAdvance();
-  try { localStorage.removeItem(CAREER_SAVE_KEY); } catch (e) {}
+  if (currentSaveId) deleteSaveSlot(currentSaveId, true);
   careerSetup = null;
   careerSetupRandom = null;
   careerSetupCustom = null;
@@ -5405,6 +5602,7 @@ function careerGameReset() {
   activeView = "home";
   selectedTeamId = null;
   confirmReset = false;
+  savesMenu = true;
   render();
 }
 
@@ -5471,6 +5669,7 @@ function bindEvents() {
   app.querySelectorAll("[data-comp-tab]").forEach((button) => { button.addEventListener("click", () => { careerCompTab = button.dataset.compTab; render(); }); });
   app.querySelector("[data-close-result]")?.addEventListener("click", () => {
     state.lastResult = null;
+    if (state.onlineAuto && onlineResults.length) state.lastResult = onlineResults.shift();
     if (state.cupWrapPending) { state.cupWrapPending = false; state.pendingLeagueWrap = true; }
     saveAndRender();
   });
@@ -5564,6 +5763,8 @@ function bindEvents() {
 }
 
 document.addEventListener("click", (event) => {
+  const saveButton = event.target.closest("[data-save]");
+  if (saveButton) { savesClick(saveButton.dataset.save, saveButton); return; }
   const onlineButton = event.target.closest("[data-online]");
   if (onlineButton) { onlineClick(onlineButton.dataset.online, onlineButton, event); return; }
   const advanceButton = event.target.closest("[data-advance]");
@@ -5615,6 +5816,8 @@ function onlineErrorText(code) {
     SALA_NO_EXISTE: [_("La sala ya no existe.", "The room no longer exists."), "The room no longer exists."],
     SIN_EQUIPO: [_("No tienes equipo en esa sala.", "You have no team in that room."), "You have no team in that room."],
     SIN_SALA: [_("No estás en ninguna sala.", "You are in no room."), "You are in no room."],
+    YA_TIENES_EQUIPO: [_("Ya tienes equipo en esta sala: no puedes cambiar.", "You already have a team in this room: you cannot switch."), "You already have a team in this room: you cannot switch."],
+    SOLO_CREADOR: [_("Solo el creador puede borrar la sala.", "Only the creator can delete the room."), "Only the creator can delete the room."],
     ACCION_DESCONOCIDA: [_("Acción no permitida online.", "Action not allowed online."), "Action not allowed online."],
     ARGS_INVALIDOS: [_("Parámetros no válidos.", "Invalid parameters."), "Invalid parameters."],
     LIGA_INVALIDA: [_("Liga no válida.", "Invalid league."), "Invalid league."],
@@ -5627,8 +5830,9 @@ function onlineErrorText(code) {
 function onlineStatusText() {
   if (onlineError && Date.now() - onlineErrorAt < 10000) return onlineError;
   const date = formatDate(state.currentDate, true);
-  if (onlineSocket && onlineSocket.readyState === 1) return `${_("En vivo", "Live")} · ${onlineRoomName} · ${date}`;
-  return `${_("Reconectando…", "Reconnecting…")} · ${date}`;
+  const who = onlineNick ? ` · ${onlineNick}` : "";
+  if (onlineSocket && onlineSocket.readyState === 1) return `${_("En vivo", "Live")} · ${onlineRoomName}${who} · ${date}`;
+  return `${_("Reconectando…", "Reconnecting…")}${who} · ${date}`;
 }
 
 function onlineClick(kind, el) {
@@ -5642,7 +5846,9 @@ function onlineClick(kind, el) {
     if (!onlineSocket || onlineSocket.readyState !== 1) { onlineError = _("Conéctate primero al servidor.", "Connect to the server first."); onlineErrorAt = Date.now(); render(); return; }
     if (!onlineNick.trim()) { onlineError = _("Escribe tu nombre de mánager.", "Type your manager name."); onlineErrorAt = Date.now(); render(); return; }
     if (!teamId) { onlineError = _("Elige un equipo libre.", "Pick a free team."); onlineErrorAt = Date.now(); render(); return; }
-    onlineSocket.send(JSON.stringify({ t: "join", roomId, teamId, nick: onlineNick.trim().slice(0, 24) }));
+    const token = (onlineTokens[roomId] && onlineTokens[roomId].manager) || null;
+    try { onlineSocket.send(JSON.stringify({ t: "join", roomId, teamId, nick: onlineNick.trim().slice(0, 24), token })); }
+    catch { onlineError = _("No se pudo enviar la solicitud.", "Could not send the request."); onlineErrorAt = Date.now(); render(); }
   }
   else if (kind === "create") {
     if (!onlineSocket || onlineSocket.readyState !== 1) { onlineError = _("Conéctate primero al servidor.", "Connect to the server first."); onlineErrorAt = Date.now(); render(); return; }
@@ -5656,6 +5862,13 @@ function onlineClick(kind, el) {
       teamId: onlineCreate.teamId,
       nick: onlineNick.trim().slice(0, 24),
     }));
+  }
+  else if (kind === "delete-room") {
+    if (!onlineDeleteArmed) { onlineDeleteArmed = true; render(); return; }
+    onlineDeleteArmed = false;
+    if (!onlineSocket || onlineSocket.readyState !== 1) return;
+    try { onlineSocket.send(JSON.stringify({ t: "delete", roomId: onlineRoomId, creatorToken: (onlineTokens[onlineRoomId] || {}).creator || null })); }
+    catch { /* noop */ }
   }
   else if (kind === "exit") { try { if (onlineSocket) onlineSocket.close(); } catch { /* noop */ } window.location.reload(); }
 }
@@ -5674,9 +5887,13 @@ function onlineConnect(autoJoin) {
   try { if (onlineSocket) onlineSocket.close(); } catch { /* noop */ }
   onlineSocket = null;
   onlineReconnects = 0;
+  onlineConnecting = true;
+  onlineOpened = false;
+  onlineError = "";
   let ws;
   try { ws = new WebSocket(onlineUrl); } catch {
-    onlineError = _("No se pudo conectar a esa dirección.", "Could not connect to that address.");
+    onlineConnecting = false;
+    onlineError = _("No se pudo conectar a esa dirección. Revisa que empiece por ws:// o wss://.", "Could not connect to that address. Check that it starts with ws:// or wss://.");
     onlineErrorAt = Date.now();
     render();
     return;
@@ -5684,23 +5901,65 @@ function onlineConnect(autoJoin) {
   onlineSocket = ws;
   render();
   ws.onopen = () => {
+    onlineConnecting = false;
+    onlineOpened = true;
+    onlineError = "";
     render();
-    if (autoJoin && onlineRoomId && onlineMyTeam) {
-      try { ws.send(JSON.stringify({ t: "join", roomId: onlineRoomId, teamId: onlineMyTeam, nick: onlineNick })); } catch { /* noop */ }
+    if (onlinePendingJoin) {
+      const pending = onlinePendingJoin;
+      onlinePendingJoin = null;
+      try { ws.send(JSON.stringify({ t: "join", roomId: pending.roomId, teamId: pending.teamId, nick: onlineNick, token: pending.token || (onlineTokens[pending.roomId] && onlineTokens[pending.roomId].manager) || null })); } catch { /* noop */ }
+    }
+    else if (autoJoin && onlineRoomId && onlineMyTeam) {
+      try { ws.send(JSON.stringify({ t: "join", roomId: onlineRoomId, teamId: onlineMyTeam, nick: onlineNick, token: (onlineTokens[onlineRoomId] && onlineTokens[onlineRoomId].manager) || null })); } catch { /* noop */ }
     }
   };
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.t === "rooms") { onlineRooms = msg.rooms || []; if (onlineLobby) render(); }
+    if (msg.t === "rooms") {
+      onlineRooms = msg.rooms || [];
+      if (msg.serverVersion) onlineServerVersion = String(msg.serverVersion);
+      if (onlineLobby) render();
+    }
+    else if (msg.t === "roomDeleted") {
+      if (!onlineRoomId || msg.roomId === onlineRoomId) {
+        onlineDisconnect();
+        if (currentSaveId) deleteSaveSlot(currentSaveId, true);
+        state = buildInitialState();
+        savesMenu = true;
+        savesMessage = _("La sala fue borrada por su creador.", "The room was deleted by its creator.");
+        render();
+      }
+      return;
+    }
     else if (msg.t === "snapshot" && msg.state) {
       onlineError = "";
       onlineReconnects = 0;
+      onlineDeleteArmed = false;
       state = msg.state;
       onlineMyTeam = msg.myTeam;
       state.managerTeamId = onlineMyTeam;
       onlineRoomId = (msg.room && msg.room.id) || onlineRoomId;
       onlineRoomName = (msg.room && msg.room.name) || "";
+      if (msg.managerToken || msg.creatorToken) {
+        onlineTokens[onlineRoomId] = {
+          manager: msg.managerToken || (onlineTokens[onlineRoomId] && onlineTokens[onlineRoomId].manager) || null,
+          creator: msg.creatorToken || (onlineTokens[onlineRoomId] && onlineTokens[onlineRoomId].creator) || null,
+        };
+      }
+      const tokens = onlineTokens[onlineRoomId] || {};
+      upsertOnlineSlot({ url: onlineUrl, roomId: onlineRoomId, roomName: onlineRoomName, teamId: onlineMyTeam, nick: onlineNick, managerToken: tokens.manager || null, creatorToken: tokens.creator || null });
+      const mySlot = getSaveSlot(currentSaveId);
+      if (mySlot && mySlot.mode === "online" && msg.room && msg.room.date && mySlot.date !== msg.room.date) {
+        mySlot.date = msg.room.date;
+        persistSaves();
+      }
+      if (Array.isArray(msg.pendingResults) && msg.pendingResults.length) {
+        onlineResults.push(...msg.pendingResults);
+        if (!state.lastResult && !savesMenu) state.lastResult = onlineResults.shift();
+      }
+      if (savesMenu) return;
       onlineLobby = false;
       activeView = "home";
       selectedTeamId = null;
@@ -5715,9 +5974,23 @@ function onlineConnect(autoJoin) {
       render();
     }
   };
+  ws.onerror = () => {
+    if (onlineSocket !== ws || onlineOpened) return;
+    onlineConnecting = false;
+    onlineError = _("No se pudo conectar. Si es la primera vez en un rato, el servidor gratuito tarda ~1 minuto en despertar: espera y reintenta.", "Could not connect. If it has been idle a while, the free server takes ~1 minute to wake up: wait and retry.");
+    onlineErrorAt = Date.now();
+    render();
+  };
   ws.onclose = () => {
     if (onlineSocket !== ws) return;
-    if (onlineRoomId && onlineMyTeam && onlineReconnects < 20 && !onlineLobby) {
+    if (!onlineOpened && onlineConnecting) {
+      onlineConnecting = false;
+      onlineError = _("Conexión cerrada antes de entrar. El servidor puede estar despertando (~1 min): espera y reintenta.", "Connection closed before joining. The server may be waking up (~1 min): wait and retry.");
+      onlineErrorAt = Date.now();
+      render();
+      return;
+    }
+    if (onlineRoomId && onlineMyTeam && onlineReconnects < 20 && !onlineLobby && !savesMenu) {
       onlineReconnects += 1;
       render();
       setTimeout(() => {
@@ -5747,6 +6020,99 @@ function renderOnlineWaiting() {
   `;
 }
 
+function relTime(ts) {
+  if (!ts) return "";
+  const mins = Math.max(0, Math.round((Date.now() - ts) / 60000));
+  if (mins < 1) return _("ahora mismo", "just now");
+  if (mins < 60) return _("hace", "ago") + ` ${mins} min`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return _("hace", "ago") + ` ${hours} h`;
+  return _("hace", "ago") + ` ${Math.round(hours / 24)} d`;
+}
+function savesClick(kind, el) {
+  if (kind === "new-solo") {
+    onlineDisconnect();
+    stopAdvance();
+    state = buildInitialState();
+    currentSaveId = null;
+    activeView = "home";
+    selectedLeagueId = null;
+    selectedTeamId = null;
+    selectedPlayerId = null;
+    marketTab = "buy";
+    homeMode = "league";
+    confirmReset = false;
+    careerSetup = null;
+    savesMenu = false;
+    onlineLobby = false;
+    render();
+  }
+  else if (kind === "menu") { savesMenu = true; render(); }
+  else if (kind === "online") {
+    onlineDisconnect();
+    stopAdvance();
+    if (state.managerTeamId) state = buildInitialState();
+    savesMenu = false;
+    onlineLobby = true;
+    render();
+  }
+  else if (kind === "back") { savesMenu = false; render(); }
+  else if (kind === "load") { savesMessage = ""; loadSaveSlot(el.dataset.id); }
+  else if (kind === "delete") {
+    const id = el.dataset.id;
+    const wasCurrent = id === currentSaveId;
+    deleteSaveSlot(id);
+    if (wasCurrent && state.managerTeamId && !state.onlineAuto) {
+      stopAdvance();
+      state = buildInitialState();
+      activeView = "home";
+      selectedTeamId = null;
+      savesMenu = true;
+    }
+    render();
+  }
+}
+function renderSavesMenu() {
+  const index = loadSavesIndex();
+  const inGame = Boolean(state.managerTeamId);
+  const modePill = (mode) => mode === "online" ? _("Online", "Online") : mode === "career" ? _("Carrera", "Career") : _("Club", "Club");
+  return `
+    <main class="screen">
+      <div class="title-row">
+        <div>
+          <h1>${_("Mis partidas", "My games")}</h1>
+          <p class="muted">${_("Cada partida se guarda sola. Cambia de una a otra sin perder nada: ni siquiera necesitas exportar a archivo.", "Every game saves itself. Switch between them without losing anything: no need to export to file.")}</p>
+        </div>
+        <div class="title-side" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+          ${langSelector()}
+          ${inGame ? `<button data-save="back">← ${_("Volver al juego", "Back to game")}</button>` : ""}
+        </div>
+      </div>
+      ${savesMessage ? `<div class="panel" style="border-color:#c0392b; margin-bottom:16px"><p style="color:#c0392b">${savesMessage}</p></div>` : ""}
+      <section class="panel">
+        <div class="form-row">
+          <button data-save="new-solo" class="primary">${_("Nueva partida", "New game")}</button>
+          <button data-save="online" class="primary">${_("Liga Online", "Online League")}</button>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="title-row"><h2>${_("Guardadas", "Saved")}</h2><span class="pill">${index.slots.length} / ${QM_MAX_SLOTS}</span></div>
+        ${index.slots.length ? index.slots.map((slot) => `
+          <div class="panel" style="margin-bottom:12px">
+            <div class="title-row"><h3>${slot.name || "—"}</h3><span class="pill">${modePill(slot.mode)}${slot.id === currentSaveId ? " · " + _("actual", "current") : ""}</span></div>
+            <p class="muted">${slot.mode === "online"
+              ? `${_("Sala", "Room")} ${slot.name} · ${teamName(slot.team) || slot.team}${slot.date ? " · " + formatDate(slot.date, true) : ""}`
+              : `${slot.team ? teamName(slot.team) : ""}${slot.date ? " · " + formatDate(slot.date, true) : ""}`} · ${relTime(slot.updatedAt)}</p>
+            <div class="form-row">
+              <button data-save="load" data-id="${slot.id}" class="primary">${_("Jugar", "Play")}</button>
+              <button data-save="delete" data-id="${slot.id}" class="danger">${_("Borrar", "Delete")}</button>
+            </div>
+          </div>`).join("") : `<p class="muted">${_("Aún no hay partidas. Crea una nueva o entra online.", "No games yet. Start a new one or go online.")}</p>`}
+      </section>
+    </main>
+  `;
+}
+
 function onlineRoomTeams(room) {
   const league = leagueById(room.leagueId);
   const preview = league ? leagueTeamsPreview(league) : [];
@@ -5758,6 +6124,7 @@ function renderOnlineLobby() {
   const connected = onlineSocket && onlineSocket.readyState === 1;
   const createLeague = leagueById(onlineCreate.leagueId) || leagueById("BR");
   const createTeams = leagueTeamsPreview(createLeague);
+  const myOnlineSlots = loadSavesIndex().slots.filter((s) => s.mode === "online" && s.ref);
   return `
     <main class="screen">
       <div class="title-row">
@@ -5772,16 +6139,31 @@ function renderOnlineLobby() {
       </div>
       ${onlineError ? `<div class="panel" style="border-color:#c0392b; margin-bottom:16px"><p style="color:#c0392b">${onlineError}</p></div>` : ""}
       <section class="panel">
-        <div class="title-row"><h2>${_("Conexión", "Connection")}</h2><span class="pill">${connected ? _("Conectado", "Connected") : _("Desconectado", "Disconnected")}</span></div>
+        <div class="title-row"><h2>${_("Conexión", "Connection")}</h2><span class="pill">${connected ? _("Conectado", "Connected") : onlineConnecting ? _("Conectando…", "Connecting…") : _("Desconectado", "Disconnected")}${onlineServerVersion ? ` · v${onlineServerVersion}` : ""}</span></div>
+        ${connected && !onlineServerVersion ? `<p class="muted">⚠ ${_("Servidor antiguo: no soporta borrar salas ni conservar equipos. Pide a quien lo hospeda que lo actualice.", "Outdated server: room deletion and team keeping unsupported. Ask the host to update it.")}</p>` : ""}
         <div class="form-row">
           <label>${_("Servidor", "Server")}: <input data-online-input="url" value="${onlineUrl.replace(/"/g, "&quot;")}" placeholder="ws://localhost:8787" style="min-width:240px" /></label>
           <label>${_("Mánager", "Manager")}: <input data-online-input="nick" value="${onlineNick.replace(/"/g, "&quot;")}" placeholder="${_("Tu nombre", "Your name")}" maxlength="24" /></label>
           ${connected
             ? `<button data-online="disconnect">${_("Desconectar", "Disconnect")}</button>`
-            : `<button data-online="connect" class="primary">${_("Conectar", "Connect")}</button>`}
+            : onlineConnecting
+              ? `<button disabled>${_("Conectando…", "Connecting…")}</button>`
+              : `<button data-online="connect" class="primary">${_("Conectar", "Connect")}</button>`}
         </div>
+        ${connected ? "" : `<p class="muted">${_("La primera conexión puede tardar ~1 minuto: el servidor gratuito se duerme sin uso y tiene que despertar.", "The first connection may take ~1 minute: the free server sleeps when idle and needs to wake up.")}</p>`}
       </section>
       ${connected ? `
+      <section class="panel">
+        <div class="title-row"><h2>${_("Tus partidas online", "Your online games")}</h2><span class="pill">${myOnlineSlots.length}</span></div>
+        ${myOnlineSlots.length ? myOnlineSlots.map((slot) => `
+          <div class="panel" style="margin-bottom:12px">
+            <div class="title-row"><h3>${slot.name || "—"}</h3><span class="pill">${_("Online", "Online")}</span></div>
+            <p class="muted">${slot.ref.nick || ""} · ${teamName(slot.team) || slot.team}${slot.date ? " · " + formatDate(slot.date, true) : ""} · ${relTime(slot.updatedAt)}</p>
+            <div class="form-row">
+              <button data-save="load" data-id="${slot.id}" class="primary">${_("Reentrar", "Rejoin")}</button>
+            </div>
+          </div>`).join("") : `<p class="muted">${_("Aún no tienes partidas online. Crea una sala o únete a una.", "You have no online games yet. Create a room or join one.")}</p>`}
+      </section>
       <section class="panel">
         <div class="title-row"><h2>${_("Crear sala", "Create room")}</h2><span class="pill">${_("Reloj configurable", "Configurable clock")}</span></div>
         <div class="form-row">
@@ -5799,16 +6181,18 @@ function renderOnlineLobby() {
         <div class="title-row"><h2>${_("Salas abiertas", "Open rooms")}</h2><span class="pill">${onlineRooms.length}</span></div>
         ${onlineRooms.length ? onlineRooms.map((room) => {
           const teams = onlineRoomTeams(room);
-          const free = teams.filter((t) => !t.taken);
+          const myNick = (onlineNick || "").trim().toLowerCase();
+          const ownerOf = (teamId) => (room.managers || []).find((m) => m.teamId === teamId);
+          const free = teams.filter((t) => !t.taken || (myNick && ownerOf(t.TeamID) && ownerOf(t.TeamID).name.toLowerCase() === myNick));
           const chosen = onlineJoinTeam[room.id] || "";
           return `
           <div class="panel" style="margin-bottom:12px">
-            <div class="title-row"><h3>${room.name}</h3><span class="pill">${leagueById(room.leagueId)?.name || room.leagueId} · ${formatDate(room.date, true)} · 1 ${_("día", "day")} / ${(room.dayMs / 60000) < 1 ? `${Math.round(room.dayMs / 1000)} s` : `${room.dayMs / 60000} min`}</span></div>
+            <div class="title-row"><h3>${room.name}</h3><span class="pill">${leagueById(room.leagueId)?.name || room.leagueId} · ${formatDate(room.date, true)} · 1 ${_("día", "day")} / ${(room.dayMs / 60000) < 1 ? `${Math.round(room.dayMs / 1000)} s` : `${room.dayMs / 60000} min`}${room.creatorNick ? ` · ${_("de", "by")} ${room.creatorNick}` : ""}</span></div>
             <p class="muted">${(room.managers || []).length ? room.managers.map((m) => `${m.name} (${teamName(m.teamId)})`).join(" · ") : _("Sala vacía: ¡sé el primero!", "Empty room: be the first!")}</p>
             <div class="form-row">
               <label>${_("Tu equipo", "Your team")}: <select data-online-input="jteam" data-room="${room.id}">
                 <option value="">—</option>
-                ${free.map((t) => `<option value="${t.TeamID}" ${chosen === t.TeamID ? "selected" : ""}>${t.Name} (OVR ${t.realOVR})</option>`).join("")}
+                ${free.map((t) => `<option value="${t.TeamID}" ${chosen === t.TeamID ? "selected" : ""}>${t.Name} (OVR ${t.realOVR})${t.taken ? ` · ${_("tu equipo", "your team")}` : ""}</option>`).join("")}
               </select></label>
               <button data-online="join" data-room="${room.id}" class="primary">${_("Unirse", "Join")}</button>
             </div>

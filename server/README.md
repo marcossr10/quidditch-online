@@ -41,13 +41,26 @@ Cámbialo en el lobby online si usas otra URL.
 Nota: el plan gratis duerme tras 15 min sin tráfico; al despertar hace
 catch-up automático de los días perdidos.
 
+## Protocolo (resumen)
+
+- `create` → `{snapshot, managerToken, creatorToken}`. Solo el creador
+  (presentando `creatorToken`) puede borrar la sala (`delete`).
+- `join {roomId, teamId, nick, token?}` → los equipos quedan ligados al
+  nick: el mismo mánager reentra con su token; otro nick es rechazado y
+  un nick con equipo no puede cambiar (`YA_TIENES_EQUIPO`).
+- Cada snapshot trae `pendingResults` (partidos de tu equipo desde la
+  última entrega) y los limpia al enviar: en vivo o al reentrar, el
+  cliente los muestra en el popup de resultado.
+
 ## Tests
 
 ```bash
 cd server
 node test-boot.mjs         # motor headless + 40 días sin pausas
-node test-integration.mjs  # salas, acciones, reloj, persistencia, reinicio
+node test-integration.mjs  # salas, tokens, borrado, reloj, persistencia, reinicio
+node test-results.mjs      # colas de resultados sin duplicados
 node test-season.mjs       # 600 días: 2 temporadas + Mundial sin pausas
-node test-client.mjs       # Chrome headless contra bundle + servidor
+node test-client.mjs       # Chrome headless: lobby, popup resultado, reloj
+node test-saves.mjs        # slots: crear, cambiar, borrar, rejoin online
 node test-solo.mjs         # single-player sin regresiones
 ```

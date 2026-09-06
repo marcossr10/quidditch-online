@@ -81,7 +81,7 @@ await waitFor(`document.querySelector('[data-online="create"]') ? true : null`);
 console.log("OK conectado al servidor, formulario de sala visible");
 
 // Elegir equipo + velocidad 30 s/día + crear
-await evalJs(`{ const s = document.querySelector('[data-online-input="cteam"]'); s.value = s.options[1].value; s.dispatchEvent(new Event("change", { bubbles: true })); }`);
+await evalJs(`{ const s = document.querySelector('[data-online-input="cteam"]'); s.value = "T01"; s.dispatchEvent(new Event("change", { bubbles: true })); }`);
 await evalJs(`{ const s = document.querySelector('[data-online-input="cspeed"]'); s.value = "30"; s.dispatchEvent(new Event("change", { bubbles: true })); }`);
 await evalJs(`document.querySelector('[data-online="create"]').click()`);
 const topbar = await waitFor(`document.querySelector(".topbar") ? document.querySelector(".topbar").innerText.slice(0, 120) : null`, 30000);
@@ -89,22 +89,35 @@ console.log("OK dentro de la sala:", JSON.stringify(topbar));
 const dock = await evalJs(`document.querySelector(".advance-dock").innerText`);
 if (!/En vivo|Live/i.test(dock)) fail(`dock no muestra En vivo: ${dock}`);
 console.log("OK dock en vivo:", JSON.stringify(dock.slice(0, 80)));
+const delBtn = await evalJs(`document.querySelector('[data-online="delete-room"]') ? document.querySelector('[data-online="delete-room"]').innerText : null`);
+if (!delBtn) fail("no aparece el botón Borrar sala en la barra");
+console.log("OK botón Borrar sala visible:", JSON.stringify(delBtn));
 
 // El reloj avanza solo: la fecha del dock cambia (30 s/día → esperar hasta 75 s)
 const d0 = await evalJs(`document.querySelector(".advance-dock").innerText`);
 const d1 = await waitFor(`(() => { const t = document.querySelector(".advance-dock").innerText; return t !== ${JSON.stringify(d0)} ? t : null; })()`, 90000);
 console.log("OK el reloj avanza solo:", JSON.stringify(d1.slice(0, 100)));
 
+// El partido del día 1 (T01 juega) llega como popup de resultado
+const modal = await waitFor(`document.querySelector(".modal-backdrop") ? document.querySelector(".modal-backdrop").innerText.slice(0, 120) : null`, 90000);
+console.log("OK popup resultado:", JSON.stringify(modal));
+await evalJs(`document.querySelector('[data-close-result]').click()`);
+await sleep(1500);
+const modalGone = await evalJs(`document.querySelector(".modal-backdrop") ? false : true`);
+if (!modalGone) fail("el popup no se cerró");
+console.log("OK popup cerrado con Continuar");
+
 // Navegar a plantilla y tocar alineación (promote/demote eco online)
 await evalJs(`document.querySelector('[data-view="squad"]').click()`);
 await waitFor(`document.querySelector("[data-promote],[data-demote]") ? true : null`, 15000);
 console.log("OK vista plantilla con acciones de alineación");
 
-// Salir vuelve a la pantalla inicial (reload)
+// Salir recarga y cae en Mis partidas con el slot online guardado
 await evalJs(`document.querySelector('[data-online="exit"]').click()`);
 await sleep(3000);
-await waitFor(`document.querySelector('[data-online="open"]') ? true : null`, 30000);
-console.log("OK salir recarga al menú");
+await waitFor(`[...document.querySelectorAll("h1")].some((h) => /My games|Mis partidas/.test(h.innerText)) ? true : null`, 30000);
+await waitFor(`document.querySelector('[data-save="load"]') ? true : null`, 15000);
+console.log("OK salir recarga al menú de partidas con slot online");
 
 ws.close();
 cleanup();
